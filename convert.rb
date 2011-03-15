@@ -1,7 +1,14 @@
 require 'rubygems'
-require 'oracle'
+require 'mysql_tables'
+require 'oracle_tables'
 
-dest = Oracle.new('instance', 'test', 'tester')
-dest.enable_constraints false
-dest.clear_table_data
-dest.enable_constraints true
+src = MysqlTables.new('localhost', 'test', 'test', 'test')
+dest = OracleTables.new('dev', 'test', 'test')
+
+oracle_table_names = src.tables.map(&:upcase)
+dest.enable_constraints false, *oracle_table_names
+dest.clear_table_data *oracle_table_names
+src.tables.each do |table_name|
+  dest.copy_table src, table_name
+end
+dest.enable_constraints true, *oracle_table_names
