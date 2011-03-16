@@ -1,32 +1,68 @@
 require 'oci8'
-require 'pp'
+require 'mysql_tables'
 
-class OracleTables
-  attr_reader :tables, :constraints
+class OracleColumn
+  NULL = 'null'
+  GEOM_TYPE = 'MDSYS.SDO_GEOMETRY'
+  ATTRIBUTES = [:name, :type_string, :data_type, :precision, :scale, :char_size, :data_size]
+  attr_reader :table, :nullable, *ATTRIBUTES
 
-  def initialize(instance_name, userid, password)
-    @tables = {}
-    @constraints = {}
-    @cn = OCI8.new(userid, password, instance_name)
+  def initialize(parent_table, column_info)
+    @table = parent_table
+    @nullable = column_info.nullable? # Can't call an attribute "nullable?" otherwise it would be in the array too'
+    ATTRIBUTES.each { |attr| instance_variable_set "@#{attr}", column_info.send(attr) }
+  end
 
-    # Read tables and store column info
-    @cn.exec('select table_name from user_tables order by table_name') do |row|
-      table_name = row[0]
-      @tables[table_name] = {:name => table_name, :columns => {}, :constraints => {}}
-      @cn.describe_table(table_name).columns.each do |col|
-        attrs = {}
-        [:name, :type_string, :data_type, :nullable?, :precision, :scale, :char_size, :data_size].each{|val| attrs[val] = col.send(val)}
-        @tables[table_name][:columns][col.name] = attrs
-      end
+  def select_text
+    mysql_name = name.downcase
+    #pp data_type
+    case data_type
+      when :named_type
+        case type_string
+          when 'MDSYS.SDO_GEOMETRY'
+            "AsWKT(#{mysql_name}) as #{mysql_name}"
+          else
+            puts "Unknown named type/object column type #{type_string} for #{table.name}.#{name}, selecting null"
+            NULL
+        end
+      else
+        mysql_name
     end
+  end
 
-    # Read constraints
-    @cn.exec('select table_name, constraint_name, constraint_type from user_constraints order by constraint_name') do |row|
-      table_name, constraint_name, constraint_type = row
-      @tables[table_name][:constraints][constraint_name] = {
-        :table_name => table_name,
-        :constraint_name => constraint_name,
-        :type => case constraint_type
+  def insert_value_text(value)
+    return NULL unless value
+    #pp data_type
+    case data_type
+      when :char, :varchar2
+        "'#{value.gsub "'", "''"}'"
+      when :date
+        "to_date('#{value.strftime("%Y-%m-%d %H:%M:%S")}', 'yyyy-mm-dd hh24:mi:ss')"
+      when :named_type
+        case type_string
+          when GEOM_TYPE
+            "#{GEOM_TYPE}('#{value}')"
+          else
+            puts "Unknown named type/object column type #{type_string} for #{table.name}.#{name}, inserting null"
+            NULL
+        end
+      else
+        value
+    end
+  end
+end
+
+class OracleConstraint
+  # Order for enabling constraints. Reverse this when disabling.
+  ENABLE_ORDER = [:check, :primary_key, :foreign_key]
+  attr_reader :name, :type, :table
+
+  def initialize(parent_table, constraint_row)
+    name, type = constraint_row
+    @table = parent_table
+    @name = name
+    @type =
+        case type
           when 'C'
             :check
           when 'P'
@@ -34,58 +70,78 @@ class OracleTables
           when 'R'
             :foreign_key
           else
-            raise "Unexpected constraint type #{constraint_type} on table #{table_name}, constraint #{constraint_name}"
-          end
-      }
-    end
+            raise "Unexpected constraint type #{type} on table #{table.name}, constraint #{name}"
+        end
+  end
+end
+
+class OracleTable
+  CONSTRAINT_SQL = 'select constraint_name, constraint_type from user_constraints where table_name = :table_name'
+  attr_reader :name, :columns, :constraints
+
+  def initialize(table_name)
+    @name = table_name
+    @columns = OracleTables.connection.describe_table(table_name).columns.map { |col| OracleColumn.new(self, col) }
+    @constraints = []
+    OracleTables.exec_sql(CONSTRAINT_SQL, table_name) { |row| @constraints << OracleConstraint.new(self, row) }
   end
 
-  # Order for enabling constraints. Reverse this when disabling.
-  CONSTRAINT_ENABLE_ORDER = [:check, :primary_key, :foreign_key]
+  def clear_data
+    OracleTables.exec_sql "delete from #{name}"
+  end
+
+  def copy_data
+    clear_data
+    read_sql = "select #{columns.map(&:select_text).join(', ')} from #{name.downcase} order by 1"
+    MysqlTables.exec_sql(read_sql).each do |row|
+      values = columns.map { |c| c.insert_value_text(row[c.name.downcase]) }
+      insert_sql = "insert into #{name}(#{columns.map(&:name).join(', ')}) values (#{values.join(', ')})"
+      OracleTables.exec_sql insert_sql
+    end
+  end
+end
+
+class OracleTables
+  attr_reader :tables, :constraints
+
+  def initialize(instance_name, userid, password)
+    @@connection = OCI8.new(userid, password, instance_name)
+
+    # Read table metadata
+    @tables = {}
+    @@connection.exec('select table_name from user_tables order by 1') do |row|
+      table_name = row[0]
+      @tables[table_name] = OracleTable.new(table_name)
+    end
+  end
 
   # List of all constraints
-  def all_constraints
-    tables.map{|name, info| info[:constraints].map(&:last)}.flatten
+  def all_constraints(table_filter=nil)
+    constraints = tables.values.map(&:constraints).flatten
+    constraints.delete_if{|c|!table_filter.include?(c.table.name)} if table_filter
+    constraints
   end
 
-  # Enable or disable all constraints
-  def enable_constraints(enable = true, *tables)
-    constraints = all_constraints.group_by{|c| c[:type]}
-    (enable ? CONSTRAINT_ENABLE_ORDER : CONSTRAINT_ENABLE_ORDER.reverse).each do |type|
-      constraints[type].each do |constraint|
-        if tables.empty? || tables.include?(constraint[:table_name])
-          sql = "alter table #{constraint[:table_name]} #{enable ? :enable : :disable} constraint #{constraint[:constraint_name]}"
-          exec_sql sql
-        end
-      end if constraints[type]
+  # Enable or disable constraints on a table
+  def enable_constraints(enable = true, table_filter=nil)
+    constraints_by_type = all_constraints(table_filter).group_by { |c| c.type }
+    (enable ? OracleConstraint::ENABLE_ORDER : OracleConstraint::ENABLE_ORDER.reverse).each do |type|
+      constraints_by_type[type].each do |constraint|
+        sql = "alter table #{constraint.table.name} #{enable ? :enable : :disable} constraint #{constraint.name}"
+        OracleTables.exec_sql sql
+      end if constraints_by_type[type]
     end
   end
 
-  def clear_table_data(*tables_to_clear)
-    tables.each do |name, info|
-      if tables_to_clear.empty? || tables_to_clear.include?(name)
-        sql = "delete from #{name}"
-        exec_sql sql
-      end
-    end
+  def self.connection
+    @@connection
   end
 
-  def copy_table(mysql_connection, mysql_table_name)
-    return unless table = tables[mysql_table_name.upcase]
-    rows = mysql_connection.read_table(mysql_table_name)
-    column_names = table[:columns].map(&:first).sort
-    sql = "insert into #{table[:name]}(#{column_names.join(', ')}) values (#{column_names.map{|c| ':' + c.downcase}.join(', ')})"
-    rows.each do |row|
-      values = column_names.map{|c| row[c.downcase]}
-      pp exec_sql sql, *values
-    end
-  end
-
-  def exec_sql(sql, *params)
+  def self.exec_sql(sql, *params, &block)
     begin
-      pp sql
-      pp params
-      @cn.exec sql, *params
+#      pp sql
+#      pp params
+      @@connection.exec sql, *params, &block
     rescue Exception => e
       raise e, "Error executing: #{sql}. params are: [#{params.join(', ')}]"
     end

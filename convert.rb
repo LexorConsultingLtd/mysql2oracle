@@ -1,14 +1,31 @@
 require 'rubygems'
 require 'mysql_tables'
 require 'oracle_tables'
+require 'pp'
 
 src = MysqlTables.new('localhost', 'test', 'test', 'test')
-dest = OracleTables.new('dev', 'test', 'test')
+dest = OracleTables.new('dev', 'userid', 'password')
+oracle_table_names = src.table_names.map(&:upcase)
 
-oracle_table_names = src.tables.map(&:upcase)
-dest.enable_constraints false, *oracle_table_names
-dest.clear_table_data *oracle_table_names
-src.tables.each do |table_name|
-  dest.copy_table src, table_name
+begin
+  # Prepare for copy
+  puts "Disabling constraints..."
+  dest.enable_constraints false, oracle_table_names
+
+  # Copy data
+  oracle_table_names.each do |table_name|
+    table = dest.tables[table_name]
+    if table
+      puts "Copying data for #{table_name}..."
+      table.copy_data
+    else
+      puts "Unable to find destination table #{table_name}, skipping"
+    end
+  end
+ensure
+  # Re-enable constraints
+  puts "Enabling constraints..."
+  dest.enable_constraints true, oracle_table_names
 end
-dest.enable_constraints true, *oracle_table_names
+
+puts "Done"
